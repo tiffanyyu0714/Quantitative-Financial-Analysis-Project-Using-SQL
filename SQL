@@ -1,0 +1,631 @@
+/* =========================================================
+0) COMMON BUILDING BLOCKS (Postgres)
+========================================================= */
+
+-- Optional: put everything in its own schema
+CREATE SCHEMA IF NOT EXISTS qf;
+SET search_path = qf, public;
+
+-- Trading calendar (you can load this from an exchange calendar later)
+CREATE TABLE IF NOT EXISTS trading_calendar (
+  dt date PRIMARY KEY,
+  is_trading_day boolean NOT NULL DEFAULT true
+);
+
+/* =========================================================
+1) Market Data Warehouse + Single Source of Truth
+========================================================= */
+
+CREATE TABLE IF NOT EXISTS assets (
+  asset_id bigserial PRIMARY KEY,
+  ticker text NOT NULL,
+  asset_type text NOT NULL CHECK (asset_type IN ('EQUITY','ETF','FX','FUTURE','OPTION','CRYPTO','INDEX')),
+  currency text NOT NULL,
+  exchange text,
+  UNIQUE (ticker, asset_type)
+);
+
+CREATE TABLE IF NOT EXISTS prices_daily (
+  asset_id bigint NOT NULL REFERENCES assets(asset_id),
+  dt date NOT NULL,
+  open numeric(20,8),
+  high numeric(20,8),
+  low  numeric(20,8),
+  close numeric(20,8) NOT NULL,
+  adj_close numeric(20,8),
+  volume numeric(28,8),
+  source text,
+  ingested_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (asset_id, dt),
+  CHECK (high IS NULL OR low IS NULL OR high >= low),
+  CHECK (close > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prices_daily_dt ON prices_daily(dt);
+CREATE INDEX IF NOT EXISTS idx_prices_daily_asset_dt ON prices_daily(asset_id, dt);
+
+CREATE TABLE IF NOT EXISTS corporate_actions_splits (
+  asset_id bigint NOT NULL REFERENCES assets(asset_id),
+  dt date NOT NULL,
+  split_ratio numeric(20,10) NOT NULL CHECK (split_ratio > 0),
+  PRIMARY KEY(asset_id, dt)
+);
+
+CREATE TABLE IF NOT EXISTS corporate_actions_dividends (
+  asset_id bigint NOT NULL REFERENCES assets(asset_id),
+  dt date NOT NULL,
+  cash_dividend numeric(20,8) NOT NULL CHECK (cash_dividend >= 0),
+  PRIMARY KEY(asset_id, dt)
+);
+
+CREATE TABLE IF NOT EXISTS fx_rates_daily (
+  base_ccy text NOT NULL,
+  quote_ccy text NOT NULL,
+  dt date NOT NULL,
+  rate numeric(20,10) NOT NULL CHECK (rate > 0),
+  PRIMARY KEY (base_ccy, quote_ccy, dt)
+);
+
+-- A) Missing-days QA: assets that have gaps inside a date range
+-- (assumes trading_calendar has all trading days)
+CREATE OR REPLACE VIEW v_price_gaps AS
+SELECT
+  a.ticker,
+  a.asset_type,
+  MIN(c.dt) AS first_missing_dt,
+  COUNT(*) AS missing_trading_days
+FROM assets a
+JOIN trading_calendar c ON c.is_trading_day
+LEFT JOIN prices_daily p
+  ON p.asset_id = a.asset_id AND p.dt = c.dt
+WHERE p.asset_id IS NULL
+GROUP BY a.ticker, a.asset_type;
+
+-- B) Daily returns (close-to-close)
+CREATE OR REPLACE VIEW v_returns_daily AS
+SELECT
+  p.asset_id,
+  p.dt,
+  (p.close / LAG(p.close) OVER (PARTITION BY p.asset_id ORDER BY p.dt) - 1.0)::numeric AS ret
+FROM prices_daily p;
+
+-- C) Top 20 by 60D realized vol (annualized) and dollar volume
+-- (simple approx: vol = stddev(ret)*sqrt(252))
+CREATE OR REPLACE VIEW v_top20_vol_liquidity AS
+WITH r AS (
+  SELECT
+    a.ticker,
+    p.dt,
+    (p.close * COALESCE(p.volume,0)) AS dollar_vol,
+    (p.close / LAG(p.close) OVER (PARTITION BY p.asset_id ORDER BY p.dt) - 1.0) AS ret
+  FROM prices_daily p
+  JOIN assets a ON a.asset_id = p.asset_id
+),
+agg AS (
+  SELECT
+    ticker,
+    MAX(dt) AS asof_dt,
+    STDDEV_SAMP(ret) * SQRT(252) AS vol_60d,
+    AVG(dollar_vol) AS avg_dollar_vol_60d
+  FROM r
+  WHERE dt >= (CURRENT_DATE - INTERVAL '90 days')  -- buffer for ~60 trading days
+  GROUP BY ticker
+)
+SELECT *
+FROM agg
+ORDER BY vol_60d DESC NULLS LAST
+LIMIT 20;
+
+
+/* =========================================================
+2) Factor Model / Cross-Sectional Signals in SQL
+========================================================= */
+
+-- Factor exposures table (materialized snapshot)
+CREATE TABLE IF NOT EXISTS factor_exposures (
+  dt date NOT NULL,
+  asset_id bigint NOT NULL REFERENCES assets(asset_id),
+  mom_12_1 numeric(20,10),
+  rev_5d numeric(20,10),
+  vol_60d numeric(20,10),
+  PRIMARY KEY(dt, asset_id)
+);
+
+-- Compute factors from prices (uses log returns for volatility)
+-- Momentum 12-1: approx using 252 trading days lookback minus last 21 days
+INSERT INTO factor_exposures (dt, asset_id, mom_12_1, rev_5d, vol_60d)
+SELECT
+  p.dt,
+  p.asset_id,
+  -- mom_12_1: close(t-21)/close(t-252) - 1 (rough)
+  (LAG(p.close, 21) OVER w / LAG(p.close, 252) OVER w - 1.0) AS mom_12_1,
+  -- short-term reversal: -(close/close_5d_ago - 1)
+  - (p.close / LAG(p.close, 5) OVER w - 1.0) AS rev_5d,
+  -- vol_60d: stddev of log returns over 60 obs * sqrt(252)
+  (STDDEV_SAMP(LN(p.close / LAG(p.close) OVER w)) OVER w60) * SQRT(252) AS vol_60d
+FROM prices_daily p
+WINDOW
+  w AS (PARTITION BY p.asset_id ORDER BY p.dt),
+  w60 AS (PARTITION BY p.asset_id ORDER BY p.dt ROWS BETWEEN 60 PRECEDING AND 1 PRECEDING);
+
+-- Cross-sectional ranks by day (deciles)
+CREATE OR REPLACE VIEW v_factor_deciles AS
+SELECT
+  dt,
+  asset_id,
+  NTILE(10) OVER (PARTITION BY dt ORDER BY mom_12_1 NULLS LAST) AS mom_decile,
+  NTILE(10) OVER (PARTITION BY dt ORDER BY vol_60d NULLS LAST) AS vol_decile
+FROM factor_exposures;
+
+
+/* =========================================================
+3) Portfolio P&L + Risk Attribution Database
+========================================================= */
+
+CREATE TABLE IF NOT EXISTS books (
+  book_id bigserial PRIMARY KEY,
+  book_name text NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS trades (
+  trade_id bigserial PRIMARY KEY,
+  book_id bigint NOT NULL REFERENCES books(book_id),
+  asset_id bigint NOT NULL REFERENCES assets(asset_id),
+  trade_dt date NOT NULL,
+  qty numeric(28,8) NOT NULL,
+  price numeric(20,8) NOT NULL,
+  fees numeric(20,8) NOT NULL DEFAULT 0
+);
+
+-- End-of-day positions (can be derived, but store for speed/auditing)
+CREATE TABLE IF NOT EXISTS positions_eod (
+  book_id bigint NOT NULL REFERENCES books(book_id),
+  asset_id bigint NOT NULL REFERENCES assets(asset_id),
+  dt date NOT NULL,
+  qty numeric(28,8) NOT NULL,
+  avg_cost numeric(20,8),
+  PRIMARY KEY (book_id, asset_id, dt)
+);
+
+-- Daily P&L from positions and close prices (unrealized only)
+CREATE OR REPLACE VIEW v_pnl_unrealized_daily AS
+SELECT
+  pos.dt,
+  b.book_name,
+  a.ticker,
+  pos.qty,
+  p.close,
+  (pos.qty * p.close) AS mkt_value,
+  (pos.qty * (p.close - pos.avg_cost)) AS unreal_pnl
+FROM positions_eod pos
+JOIN books b ON b.book_id = pos.book_id
+JOIN assets a ON a.asset_id = pos.asset_id
+JOIN prices_daily p ON p.asset_id = pos.asset_id AND p.dt = pos.dt;
+
+-- Realized P&L approximation (FIFO is hard in pure SQL; here’s avg-cost method)
+-- realized_pnl per trade = qty*(sell_price - current_avg_cost_before_trade)
+-- (You’d usually do this in ETL; but SQL can still show the concept)
+CREATE TABLE IF NOT EXISTS realized_pnl (
+  book_id bigint NOT NULL REFERENCES books(book_id),
+  asset_id bigint NOT NULL REFERENCES assets(asset_id),
+  trade_id bigint NOT NULL REFERENCES trades(trade_id),
+  trade_dt date NOT NULL,
+  realized_pnl numeric(20,8) NOT NULL,
+  PRIMARY KEY(trade_id)
+);
+
+-- Exposure summary by book/date
+CREATE OR REPLACE VIEW v_exposure_summary AS
+SELECT
+  dt,
+  book_name,
+  SUM(ABS(mkt_value)) AS gross_exposure,
+  SUM(mkt_value) AS net_exposure
+FROM (
+  SELECT
+    pos.dt,
+    b.book_name,
+    (pos.qty * p.close) AS mkt_value
+  FROM positions_eod pos
+  JOIN books b ON b.book_id = pos.book_id
+  JOIN prices_daily p ON p.asset_id = pos.asset_id AND p.dt = pos.dt
+) x
+GROUP BY dt, book_name;
+
+
+/* =========================================================
+4) VaR / Stress Testing Data Layer (SQL Engine)
+========================================================= */
+
+-- Returns matrix table (long format)
+CREATE TABLE IF NOT EXISTS returns_long (
+  dt date NOT NULL,
+  asset_id bigint NOT NULL REFERENCES assets(asset_id),
+  ret numeric(20,10) NOT NULL,
+  PRIMARY KEY(dt, asset_id)
+);
+
+-- Load from prices
+INSERT INTO returns_long (dt, asset_id, ret)
+SELECT
+  dt,
+  asset_id,
+  (close / LAG(close) OVER (PARTITION BY asset_id ORDER BY dt) - 1.0)
+FROM prices_daily;
+
+-- Rolling volatility (used by parametric VaR or risk monitoring)
+CREATE OR REPLACE VIEW v_rolling_vol_60 AS
+SELECT
+  asset_id,
+  dt,
+  STDDEV_SAMP(ret) OVER (PARTITION BY asset_id ORDER BY dt ROWS BETWEEN 60 PRECEDING AND 1 PRECEDING) * SQRT(252) AS vol_60
+FROM returns_long;
+
+-- Stress scenarios: store named shocks (e.g., -5% equity shock)
+CREATE TABLE IF NOT EXISTS stress_scenarios (
+  scenario_id bigserial PRIMARY KEY,
+  scenario_name text NOT NULL UNIQUE,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS stress_shocks (
+  scenario_id bigint NOT NULL REFERENCES stress_scenarios(scenario_id),
+  asset_id bigint NOT NULL REFERENCES assets(asset_id),
+  shock_return numeric(20,10) NOT NULL, -- e.g. -0.05
+  PRIMARY KEY(scenario_id, asset_id)
+);
+
+-- Apply scenario to current positions to estimate stressed P&L
+CREATE OR REPLACE VIEW v_stress_pnl AS
+SELECT
+  pos.dt,
+  b.book_name,
+  sc.scenario_name,
+  SUM(pos.qty * p.close * sh.shock_return) AS stressed_pnl
+FROM positions_eod pos
+JOIN books b ON b.book_id = pos.book_id
+JOIN prices_daily p ON p.asset_id = pos.asset_id AND p.dt = pos.dt
+JOIN stress_shocks sh ON sh.asset_id = pos.asset_id
+JOIN stress_scenarios sc ON sc.scenario_id = sh.scenario_id
+GROUP BY pos.dt, b.book_name, sc.scenario_name;
+
+
+/* =========================================================
+5) Options Chain Store + Implied Vol Surface Analytics
+========================================================= */
+
+CREATE TABLE IF NOT EXISTS options_quotes (
+  ts timestamptz NOT NULL,
+  underlying_asset_id bigint NOT NULL REFERENCES assets(asset_id),
+  expiry date NOT NULL,
+  strike numeric(20,8) NOT NULL,
+  call_put char(1) NOT NULL CHECK (call_put IN ('C','P')),
+  bid numeric(20,8),
+  ask numeric(20,8),
+  mid numeric(20,8) GENERATED ALWAYS AS (
+    CASE
+      WHEN bid IS NOT NULL AND ask IS NOT NULL THEN (bid + ask) / 2
+      ELSE NULL
+    END
+  ) STORED,
+  iv numeric(20,10),          -- implied vol (from your calc)
+  delta numeric(20,10),
+  gamma numeric(20,10),
+  vega numeric(20,10),
+  PRIMARY KEY (ts, underlying_asset_id, expiry, strike, call_put)
+);
+
+CREATE INDEX IF NOT EXISTS idx_opt_quotes_under_ts ON options_quotes(underlying_asset_id, ts);
+CREATE INDEX IF NOT EXISTS idx_opt_quotes_expiry ON options_quotes(expiry);
+
+-- ATM IV per expiry snapshot: choose strike closest to spot
+-- assumes you have spot in prices_daily for the underlying on that date
+CREATE OR REPLACE VIEW v_atm_iv AS
+WITH spot AS (
+  SELECT asset_id, dt, close AS spot
+  FROM prices_daily
+),
+snap AS (
+  SELECT
+    oq.ts,
+    oq.underlying_asset_id,
+    oq.expiry,
+    oq.strike,
+    oq.call_put,
+    oq.iv,
+    s.spot,
+    ABS(oq.strike - s.spot) AS moneyness_dist,
+    ROW_NUMBER() OVER (
+      PARTITION BY oq.ts, oq.underlying_asset_id, oq.expiry
+      ORDER BY ABS(oq.strike - s.spot)
+    ) AS rn
+  FROM options_quotes oq
+  JOIN spot s
+    ON s.asset_id = oq.underlying_asset_id
+   AND s.dt = (oq.ts AT TIME ZONE 'UTC')::date
+  WHERE oq.call_put = 'C' AND oq.iv IS NOT NULL
+)
+SELECT ts, underlying_asset_id, expiry, strike AS atm_strike, iv AS atm_iv
+FROM snap
+WHERE rn = 1;
+
+-- Simple skew proxy: IV(put, lower strike) - IV(call, higher strike) near 25-delta
+-- If you store delta: grab closest |delta|=0.25
+CREATE OR REPLACE VIEW v_skew_25d AS
+WITH ranked AS (
+  SELECT
+    ts, underlying_asset_id, expiry, call_put, strike, iv, delta,
+    ROW_NUMBER() OVER (
+      PARTITION BY ts, underlying_asset_id, expiry, call_put
+      ORDER BY ABS(ABS(delta) - 0.25)
+    ) AS rn
+  FROM options_quotes
+  WHERE iv IS NOT NULL AND delta IS NOT NULL
+)
+SELECT
+  c.ts,
+  c.underlying_asset_id,
+  c.expiry,
+  (p.iv - c.iv) AS skew_put_minus_call_25d
+FROM ranked c
+JOIN ranked p
+  ON p.ts = c.ts
+ AND p.underlying_asset_id = c.underlying_asset_id
+ AND p.expiry = c.expiry
+WHERE c.call_put = 'C' AND c.rn = 1
+  AND p.call_put = 'P' AND p.rn = 1;
+
+
+/* =========================================================
+6) Event Study Engine (earnings / macro timestamps)
+========================================================= */
+
+CREATE TABLE IF NOT EXISTS events (
+  event_id bigserial PRIMARY KEY,
+  asset_id bigint NOT NULL REFERENCES assets(asset_id),
+  event_ts timestamptz NOT NULL,
+  event_type text NOT NULL,          -- 'EARNINGS', 'FOMC', etc.
+  meta jsonb
+);
+
+-- Event windows (relative day indexing)
+CREATE TABLE IF NOT EXISTS event_windows (
+  event_id bigint NOT NULL REFERENCES events(event_id),
+  rel_day int NOT NULL,             -- -20..+20
+  dt date NOT NULL,
+  ret numeric(20,10),
+  cum_ret numeric(20,10),
+  PRIMARY KEY(event_id, rel_day)
+);
+
+-- Build a [-20,+20] window using trading_calendar
+-- (Requires trading_calendar to be populated for those dates)
+INSERT INTO event_windows (event_id, rel_day, dt, ret, cum_ret)
+WITH e AS (
+  SELECT event_id, asset_id, (event_ts AT TIME ZONE 'UTC')::date AS event_dt
+  FROM events
+),
+cal AS (
+  SELECT
+    e.event_id,
+    e.asset_id,
+    c.dt,
+    ROW_NUMBER() OVER (PARTITION BY e.event_id ORDER BY c.dt) AS rn
+  FROM e
+  JOIN trading_calendar c
+    ON c.dt BETWEEN (e.event_dt - INTERVAL '40 days')::date AND (e.event_dt + INTERVAL '40 days')::date
+   AND c.is_trading_day
+),
+anchor AS (
+  SELECT
+    event_id,
+    asset_id,
+    MIN(rn) FILTER (WHERE dt >= (SELECT event_dt FROM e WHERE e.event_id = cal.event_id)) AS anchor_rn
+  FROM cal
+  GROUP BY event_id, asset_id
+),
+win AS (
+  SELECT
+    cal.event_id,
+    cal.asset_id,
+    cal.dt,
+    (cal.rn - a.anchor_rn) AS rel_day
+  FROM cal
+  JOIN anchor a USING (event_id, asset_id)
+  WHERE (cal.rn - a.anchor_rn) BETWEEN -20 AND 20
+),
+rets AS (
+  SELECT
+    w.event_id,
+    w.rel_day,
+    w.dt,
+    r.ret
+  FROM win w
+  LEFT JOIN returns_long r
+    ON r.asset_id = w.asset_id AND r.dt = w.dt
+)
+SELECT
+  event_id,
+  rel_day,
+  dt,
+  ret,
+  SUM(COALESCE(ret,0)) OVER (PARTITION BY event_id ORDER BY rel_day) AS cum_ret
+FROM rets;
+
+-- Summary: average CAR by event type
+CREATE OR REPLACE VIEW v_event_car_summary AS
+SELECT
+  ev.event_type,
+  ew.rel_day,
+  AVG(ew.cum_ret) AS avg_cum_ret
+FROM event_windows ew
+JOIN events ev ON ev.event_id = ew.event_id
+GROUP BY ev.event_type, ew.rel_day
+ORDER BY ev.event_type, ew.rel_day;
+
+
+/* =========================================================
+7) Stat Arb Data Mart (Pairs / Monitoring Features)
+========================================================= */
+
+CREATE TABLE IF NOT EXISTS pair_metrics (
+  dt date NOT NULL,
+  asset_id_a bigint NOT NULL REFERENCES assets(asset_id),
+  asset_id_b bigint NOT NULL REFERENCES assets(asset_id),
+  corr_120 numeric(20,10),
+  spread_z numeric(20,10),
+  PRIMARY KEY (dt, asset_id_a, asset_id_b),
+  CHECK (asset_id_a < asset_id_b)
+);
+
+-- Build rolling correlation (120D) between pairs (within a universe)
+-- WARNING: pairwise joins can explode. Restrict universe (e.g., top 200 liquid).
+-- Example universe: equities only
+WITH universe AS (
+  SELECT asset_id
+  FROM assets
+  WHERE asset_type = 'EQUITY'
+  LIMIT 200
+),
+r AS (
+  SELECT dt, asset_id, ret
+  FROM returns_long
+  WHERE asset_id IN (SELECT asset_id FROM universe)
+),
+pairs AS (
+  SELECT a.asset_id AS a_id, b.asset_id AS b_id
+  FROM universe a
+  JOIN universe b ON a.asset_id < b.asset_id
+),
+joined AS (
+  SELECT
+    p.dt,
+    pr.a_id,
+    pr.b_id,
+    ra.ret AS ret_a,
+    rb.ret AS ret_b
+  FROM pairs pr
+  JOIN r ra ON ra.asset_id = pr.a_id
+  JOIN r rb ON rb.asset_id = pr.b_id AND rb.dt = ra.dt
+  JOIN (SELECT DISTINCT dt FROM r) p ON p.dt = ra.dt
+)
+INSERT INTO pair_metrics (dt, asset_id_a, asset_id_b, corr_120, spread_z)
+SELECT
+  dt,
+  a_id,
+  b_id,
+  CORR(ret_a, ret_b) OVER (PARTITION BY a_id, b_id ORDER BY dt ROWS BETWEEN 120 PRECEDING AND 1 PRECEDING) AS corr_120,
+  -- Spread z-score using return spread (toy). Better: log price spread.
+  (
+    (ret_a - ret_b)
+    - AVG(ret_a - ret_b) OVER (PARTITION BY a_id, b_id ORDER BY dt ROWS BETWEEN 120 PRECEDING AND 1 PRECEDING)
+  )
+  / NULLIF(
+    STDDEV_SAMP(ret_a - ret_b) OVER (PARTITION BY a_id, b_id ORDER BY dt ROWS BETWEEN 120 PRECEDING AND 1 PRECEDING),
+    0
+  ) AS spread_z
+FROM joined;
+
+-- Query: pairs with high corr and extreme z
+CREATE OR REPLACE VIEW v_pair_trade_candidates AS
+SELECT *
+FROM pair_metrics
+WHERE corr_120 >= 0.8
+  AND ABS(spread_z) >= 2.0;
+
+
+/* =========================================================
+8) Trade Surveillance-Lite (Anomaly Features / Alerts)
+========================================================= */
+
+CREATE TABLE IF NOT EXISTS accounts (
+  account_id bigserial PRIMARY KEY,
+  account_name text,
+  risk_tier text
+);
+
+CREATE TABLE IF NOT EXISTS orders_trades (
+  event_id bigserial PRIMARY KEY,
+  account_id bigint NOT NULL REFERENCES accounts(account_id),
+  asset_id bigint NOT NULL REFERENCES assets(asset_id),
+  ts timestamptz NOT NULL,
+  side char(1) NOT NULL CHECK (side IN ('B','S')),
+  qty numeric(28,8) NOT NULL CHECK (qty > 0),
+  price numeric(20,8) NOT NULL CHECK (price > 0),
+  venue text,
+  order_id text
+);
+
+CREATE TABLE IF NOT EXISTS alerts (
+  alert_id bigserial PRIMARY KEY,
+  alert_ts timestamptz NOT NULL DEFAULT now(),
+  alert_dt date NOT NULL DEFAULT CURRENT_DATE,
+  account_id bigint REFERENCES accounts(account_id),
+  asset_id bigint REFERENCES assets(asset_id),
+  alert_type text NOT NULL,      -- 'UNUSUAL_VOLUME', 'RAPID_IN_OUT', etc.
+  score numeric(20,10) NOT NULL,
+  evidence jsonb
+);
+
+-- A) Unusual volume for an account vs its own trailing 30D average
+WITH daily_acct_vol AS (
+  SELECT
+    account_id,
+    asset_id,
+    (ts AT TIME ZONE 'UTC')::date AS dt,
+    SUM(qty) AS qty_sum
+  FROM orders_trades
+  GROUP BY 1,2,3
+),
+scored AS (
+  SELECT
+    account_id,
+    asset_id,
+    dt,
+    qty_sum,
+    AVG(qty_sum) OVER (PARTITION BY account_id, asset_id ORDER BY dt ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING) AS avg30,
+    STDDEV_SAMP(qty_sum) OVER (PARTITION BY account_id, asset_id ORDER BY dt ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING) AS sd30
+  FROM daily_acct_vol
+)
+INSERT INTO alerts (account_id, asset_id, alert_type, score, evidence)
+SELECT
+  account_id,
+  asset_id,
+  'UNUSUAL_VOLUME',
+  (qty_sum - avg30) / NULLIF(sd30,0) AS score,
+  jsonb_build_object('dt', dt, 'qty', qty_sum, 'avg30', avg30, 'sd30', sd30)
+FROM scored
+WHERE sd30 IS NOT NULL
+  AND (qty_sum - avg30) / NULLIF(sd30,0) >= 4;
+
+-- B) Rapid in-and-out (round-trip) within same day: buy then sell (or vice versa)
+WITH day_flows AS (
+  SELECT
+    account_id,
+    asset_id,
+    (ts AT TIME ZONE 'UTC')::date AS dt,
+    SUM(CASE WHEN side='B' THEN qty ELSE 0 END) AS buy_qty,
+    SUM(CASE WHEN side='S' THEN qty ELSE 0 END) AS sell_qty
+  FROM orders_trades
+  GROUP BY 1,2,3
+),
+rt AS (
+  SELECT
+    account_id, asset_id, dt,
+    LEAST(buy_qty, sell_qty) / NULLIF(GREATEST(buy_qty, sell_qty),0) AS roundtrip_ratio
+  FROM day_flows
+)
+INSERT INTO alerts (account_id, asset_id, alert_type, score, evidence)
+SELECT
+  account_id,
+  asset_id,
+  'RAPID_IN_OUT',
+  roundtrip_ratio,
+  jsonb_build_object('dt', dt, 'buy_qty', buy_qty, 'sell_qty', sell_qty, 'roundtrip_ratio', roundtrip_ratio)
+FROM (
+  SELECT rt.*, df.buy_qty, df.sell_qty
+  FROM rt
+  JOIN day_flows df USING (account_id, asset_id, dt)
+) x
+WHERE roundtrip_ratio >= 0.8
+  AND (buy_qty + sell_qty) >= 1000;  -- threshold example
